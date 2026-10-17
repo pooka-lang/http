@@ -1,0 +1,828 @@
+//// Requests, responses and the words they share.
+////
+//// This module has no server and no client in it. It is the vocabulary that
+//// servers, clients and frameworks agree on, so a handler written for one
+//// server can be tested without any server at all, and a request built for a
+//// client looks like the one a server receives.
+////
+//// ```pooka
+//// import pooka/http.{Request, Response}
+////
+//// handle(request: Request) -> Response {
+////   match #(request.method, request.segments()) {
+////     #(http.Get, []) -> http.text(200, "Welcome to the night library")
+////     #(http.Get, ["books", id]) -> http.text(200, "Book " + id)
+////     _ -> http.text(404, "Nothing on this shelf")
+////   }
+//// }
+//// ```
+////
+//// Header names are kept in lowercase, the way HTTP/2 writes them, so looking
+//// one up never depends on how the other side spelled it.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module http
+
+import pooka/bit_array
+import pooka/int
+import pooka/list
+import pooka/string
+import pooka/uri
+import pooka/option
+
+// --- methods ------------------------------------------------------------------
+
+/// What a request asks for.
+class Method {}
+
+class Get is Method {}
+
+class Post is Method {}
+
+class Put is Method {}
+
+class Patch is Method {}
+
+class Delete is Method {}
+
+class Head is Method {}
+
+class Options is Method {}
+
+class Trace is Method {}
+
+class Connect is Method {}
+
+/// Any other method, as it was written, such as `PROPFIND`.
+class Other(name: String) is Method
+
+/// Read a method from its name. Standard methods are matched without regard
+/// to case; anything else becomes `Other`, in uppercase.
+///
+/// ```pooka
+/// import pooka/http
+///
+/// assert http.method_from_string("get") == http.Get()
+/// assert http.method_from_string("BREW") == http.Other("BREW")
+/// ```
+method_from_string(name: String) -> Method {
+  // Servers almost always hand over uppercase names; skip the copy for them.
+  match name {
+    "GET" -> Get()
+    "POST" -> Post()
+    _ -> _method_from_upper(string.uppercase(name))
+  }
+}
+
+_method_from_upper(name: String) -> Method {
+  match name {
+    "GET" -> Get()
+    "POST" -> Post()
+    "PUT" -> Put()
+    "PATCH" -> Patch()
+    "DELETE" -> Delete()
+    "HEAD" -> Head()
+    "OPTIONS" -> Options()
+    "TRACE" -> Trace()
+    "CONNECT" -> Connect()
+    other -> Other(other)
+  }
+}
+
+/// A method's name, as it goes on the wire.
+method_to_string(method: Method) -> String {
+  match method {
+    Get -> "GET"
+    Post -> "POST"
+    Put -> "PUT"
+    Patch -> "PATCH"
+    Delete -> "DELETE"
+    Head -> "HEAD"
+    Options -> "OPTIONS"
+    Trace -> "TRACE"
+    Connect -> "CONNECT"
+    Other(name) -> name
+  }
+}
+
+// --- headers ------------------------------------------------------------------
+
+/// The value of the first header with this name, whatever its case.
+find_header(headers: List(#(String, String)), name: String) -> Option(String) {
+  let wanted = _Ffi.lowercase(name)
+  match list.find(headers, fn(pair: #(String, String)) {
+    _Ffi.lowercase(pair.0) == wanted
+  }) {
+    Some(#(_, value)) -> Some(value)
+    None -> None
+  }
+}
+
+/// Every value of headers with this name, in order. Useful for `set-cookie`,
+/// which may appear many times.
+header_values(headers: List(#(String, String)), name: String) -> List(String) {
+  let wanted = _Ffi.lowercase(name)
+  list.filter_map(headers, fn(pair: #(String, String)) {
+    match _Ffi.lowercase(pair.0) == wanted {
+      True -> Some(pair.1)
+      False -> None
+    }
+  })
+}
+
+/// Replace every header with this name by one with this value.
+set_header(
+  headers: List(#(String, String)),
+  name: String,
+  value: String
+) -> List(#(String, String)) {
+  let lower = _Ffi.lowercase(name)
+  let others = list.filter(headers, fn(pair: #(String, String)) {
+    _Ffi.lowercase(pair.0) != lower
+  })
+  list.append(others, #(lower, value))
+}
+
+/// Add a header, keeping any others with the same name.
+add_header(
+  headers: List(#(String, String)),
+  name: String,
+  value: String
+) -> List(#(String, String)) {
+  list.append(headers, #(_Ffi.lowercase(name), value))
+}
+
+// --- requests -----------------------------------------------------------------
+
+/// A request, as a client sends it or a server receives it.
+///
+/// `path` is percent-encoded, as it was on the wire; `segments` decodes it.
+/// `query` is the part after `?`, also still encoded; `query_params` decodes
+/// it. `port` is `None` when it is the scheme's usual one. The body is bytes;
+/// `text` reads it as UTF-8.
+class Request {
+  let method: Method
+  let scheme: String
+  let host: String
+  let port: Option(Int)
+  let path: String
+  let query: Option(String)
+  let headers: List(#(String, String))
+  let body: BitArray
+
+  new(
+    method: Method,
+    scheme: String,
+    host: String,
+    port: Option(Int),
+    path: String,
+    query: Option(String),
+    headers: List(#(String, String)),
+    body: BitArray
+  ) {
+    self.method = method
+    self.scheme = scheme
+    self.host = host
+    self.port = port
+    self.path = path
+    self.query = query
+    self.headers = headers
+    self.body = body
+  }
+
+  /// The value of a header, whatever case it is asked for in.
+  header(name: String) -> Option(String) {
+    find_header(headers, name)
+  }
+
+  /// The path, split at `/` and decoded, without empty pieces. Match on it to
+  /// route: `/books/7/` gives `["books", "7"]`.
+  segments() -> List(String) {
+    _segments(path)
+  }
+
+  /// The query's pairs, decoded, in their written order. A malformed query
+  /// gives no pairs.
+  query_params() -> List(#(String, String)) {
+    match query {
+      Some(text) -> match parse_query(text) {
+        Ok(pairs) -> pairs
+        Error(_) -> []
+      }
+      None -> []
+    }
+  }
+
+  /// Read query pairs without mistaking a broken escape for an empty query.
+  ///
+  /// ```pooka
+  /// assert http.default_request().checked_query_params() == Ok([])
+  /// ```
+  checked_query_params() -> Result(List(#(String, String)), Nil) {
+    match query {
+      None -> Ok([])
+      Some(text) -> parse_query(text)
+    }
+  }
+
+  /// Decode path pieces, returning the first malformed escape to the caller.
+  ///
+  /// ```pooka
+  /// assert http.default_request().with_path("/%zz").checked_segments() == Error(Nil)
+  /// ```
+  checked_segments() -> Result(List(String), Nil) {
+    list.filter(string.split(path, "/"), fn(piece) { piece != "" })
+    |> list.try_map(percent_decode)
+  }
+
+  /// The first value of a query parameter.
+  query_param(name: String) -> Option(String) {
+    match list.find(query_params(), fn(pair: #(String, String)) {
+      pair.0 == name
+    }) {
+      Some(#(_, value)) -> Some(value)
+      None -> None
+    }
+  }
+
+  /// The cookies the client sent, as name and value.
+  cookies() -> List(#(String, String)) {
+    _cookies(header_values(headers, "cookie"))
+  }
+
+  /// The value of one cookie.
+  cookie(name: String) -> Option(String) {
+    match list.find(cookies(), fn(pair: #(String, String)) { pair.0 == name }) {
+      Some(#(_, value)) -> Some(value)
+      None -> None
+    }
+  }
+
+  /// The body as text, if it is valid UTF-8.
+  text() -> Result(String, Nil) {
+    match bit_array.to_string(body) {
+      Ok(text) -> Ok(text)
+      Error(_) -> Error(Nil)
+    }
+  }
+
+  /// Check the parts that will become an HTTP message before opening a socket.
+  /// A newline is useful in a letter, but has no business inside a field value.
+  ///
+  /// ```pooka
+  /// let request = http.default_request().with_header("x-note", "owl\r\nforged: yes")
+  /// let assert Error(_) = request.validate()
+  /// ```
+  validate() -> Result(Nil, String) {
+    _Ffi.validate_request(
+      method_to_string(method),
+      scheme,
+      host,
+      port,
+      path,
+      query,
+      headers,
+      body
+    )
+  }
+
+  /// The whole URL, put back together.
+  url() -> String {
+    let port_part = match port {
+      Some(number) -> ":" + int.to_string(number)
+      None -> ""
+    }
+    let query_part = match query {
+      Some(text) -> "?" + text
+      None -> ""
+    }
+    let authority = match string.contains(host, ":") && !string.starts_with(
+      host,
+      "["
+    ) {
+      True -> "[" + host + "]"
+      False -> host
+    }
+    scheme + "://" + authority + port_part + path + query_part
+  }
+
+  with_method(method: Method) -> Request {
+    Request(method, scheme, host, port, path, query, headers, body)
+  }
+
+  with_path(path: String) -> Request {
+    Request(method, scheme, host, port, path, query, headers, body)
+  }
+
+  /// Set the query from pairs, encoding them.
+  with_query(pairs: List(#(String, String))) -> Request {
+    let encoded = match pairs {
+      [] -> None
+      _ -> Some(encode_query(pairs))
+    }
+    Request(method, scheme, host, port, path, encoded, headers, body)
+  }
+
+  with_header(name: String, value: String) -> Request {
+    let replaced = set_header(headers, name, value)
+    Request(method, scheme, host, port, path, query, replaced, body)
+  }
+
+  with_body(body: BitArray) -> Request {
+    Request(method, scheme, host, port, path, query, headers, body)
+  }
+
+  /// Set a text body, and its content type if none is set yet.
+  with_text(text: String) -> Request {
+    let typed = _default_type(headers, "text/plain; charset=utf-8")
+    Request(
+      method,
+      scheme,
+      host,
+      port,
+      path,
+      query,
+      typed,
+      bit_array.from_string(text)
+    )
+  }
+
+  /// Set a body of JSON text, already encoded, and its content type.
+  with_json(text: String) -> Request {
+    let typed = set_header(headers, "content-type", "application/json")
+    Request(
+      method,
+      scheme,
+      host,
+      port,
+      path,
+      query,
+      typed,
+      bit_array.from_string(text)
+    )
+  }
+}
+
+/// A request for a URL, with the given method and no body.
+///
+/// ```pooka
+/// import pooka/http
+///
+/// let assert Ok(request) = http.request(http.Get(), "https://example.org/owls?age=3")
+/// assert request.host == "example.org"
+/// assert request.segments() == ["owls"]
+/// assert request.query_param("age") == Some("3")
+/// ```
+request(method: Method, url: String) -> Result(Request, String) {
+  let address = match uri.parse(url) {
+    Ok(value) -> Ok(value)
+    Error(_) -> Error("this is not a valid URL")
+  }?
+  match #(address.scheme, address.host) {
+    #(Some(scheme), Some(host)) if host != "" -> {
+      let lower = string.lowercase(scheme)
+      match lower == "http" || lower == "https" {
+        False -> Error("HTTP URLs must use http or https")
+        True -> match address.userinfo {
+          Some(_) -> Error(
+            "put credentials in an authorization header, not in the URL"
+          )
+          None -> match address.port {
+            Some(port) if port < 1 || port > 65535 -> Error(
+              "a port must be between 1 and 65535"
+            )
+            _ -> {
+              let path = match address.path {
+                "" -> "/"
+                other -> other
+              }
+              Ok(
+                Request(
+                  method,
+                  lower,
+                  host,
+                  address.port,
+                  path,
+                  address.query,
+                  [],
+                  <<>>
+                )
+              )
+            }
+          }
+        }
+      }
+    }
+    _ -> Error("a URL needs a scheme and a host, such as https://example.org/")
+  }
+}
+
+/// A GET request for a URL.
+get(url: String) -> Result(Request, String) {
+  request(Get(), url)
+}
+
+/// A POST request for a URL.
+post(url: String) -> Result(Request, String) {
+  request(Post(), url)
+}
+
+/// A request to `http://localhost/`, to adjust for tests.
+///
+/// ```pooka
+/// import pooka/http
+///
+/// let request = http.default_request().with_path("/owls")
+/// ```
+default_request() -> Request {
+  Request(Get(), "http", "localhost", None, "/", None, [], <<>>)
+}
+
+// --- responses ----------------------------------------------------------------
+
+/// A response, as a server sends it or a client receives it.
+class Response {
+  let status: Int
+  let headers: List(#(String, String))
+  let body: BitArray
+
+  new(status: Int, headers: List(#(String, String)), body: BitArray) {
+    self.status = status
+    self.headers = headers
+    self.body = body
+  }
+
+  header(name: String) -> Option(String) {
+    find_header(headers, name)
+  }
+
+  /// The body as text, if it is valid UTF-8.
+  text() -> Result(String, Nil) {
+    match bit_array.to_string(body) {
+      Ok(text) -> Ok(text)
+      Error(_) -> Error(Nil)
+    }
+  }
+
+  /// Is the status between 200 and 299?
+  is_success() -> Bool {
+    status >= 200 && status < 300
+  }
+
+  with_status(status: Int) -> Response {
+    Response(status, headers, body)
+  }
+
+  with_header(name: String, value: String) -> Response {
+    Response(status, set_header(headers, name, value), body)
+  }
+
+  with_body(body: BitArray) -> Response {
+    Response(status, headers, body)
+  }
+
+  /// Add a cookie for the client to keep.
+  set_cookie(cookie: Cookie) -> Response {
+    Response(status, add_header(headers, "set-cookie", cookie.header()), body)
+  }
+}
+
+/// An empty response.
+response(status: Int) -> Response {
+  Response(status, [], <<>>)
+}
+
+/// A plain text response.
+///
+/// ```pooka
+/// import pooka/http
+///
+/// let reply = http.text(200, "hoo")
+/// assert reply.header("Content-Type") == Some("text/plain; charset=utf-8")
+/// ```
+text(status: Int, body: String) -> Response {
+  Response(
+    status,
+    [#("content-type", "text/plain; charset=utf-8")],
+    bit_array.from_string(body)
+  )
+}
+
+/// An HTML response.
+html(status: Int, body: String) -> Response {
+  Response(
+    status,
+    [#("content-type", "text/html; charset=utf-8")],
+    bit_array.from_string(body)
+  )
+}
+
+/// A response of JSON text, already encoded, for instance with `pooka/json`.
+json(status: Int, body: String) -> Response {
+  Response(
+    status,
+    [#("content-type", "application/json")],
+    bit_array.from_string(body)
+  )
+}
+
+/// Send the client somewhere else. `303 See Other` makes the client follow
+/// with a GET, which is right after a form has been posted.
+redirect(location: String) -> Response {
+  Response(303, [#("location", location)], <<>>)
+}
+
+/// The usual phrase for a status, such as `Not Found` for 404.
+reason(status: Int) -> String {
+  match status {
+    100 -> "Continue"
+    101 -> "Switching Protocols"
+    200 -> "OK"
+    201 -> "Created"
+    202 -> "Accepted"
+    204 -> "No Content"
+    301 -> "Moved Permanently"
+    302 -> "Found"
+    303 -> "See Other"
+    304 -> "Not Modified"
+    307 -> "Temporary Redirect"
+    308 -> "Permanent Redirect"
+    400 -> "Bad Request"
+    401 -> "Unauthorized"
+    403 -> "Forbidden"
+    404 -> "Not Found"
+    405 -> "Method Not Allowed"
+    409 -> "Conflict"
+    413 -> "Content Too Large"
+    415 -> "Unsupported Media Type"
+    422 -> "Unprocessable Content"
+    429 -> "Too Many Requests"
+    500 -> "Internal Server Error"
+    501 -> "Not Implemented"
+    502 -> "Bad Gateway"
+    503 -> "Service Unavailable"
+    504 -> "Gateway Timeout"
+    _ -> ""
+  }
+}
+
+// --- cookies ------------------------------------------------------------------
+
+/// How strictly a browser keeps a cookie to its own site.
+enum SameSite {
+  Strict,
+  Lax,
+  NoRestriction
+}
+
+/// A cookie to send with a response. Start with `cookie`, then adjust it.
+///
+/// ```pooka
+/// import pooka/http
+///
+/// let session = http.cookie("session", "abc123").with_max_age(3600)
+/// assert session.header() == "session=abc123; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Lax"
+/// ```
+class Cookie {
+  let name: String
+  let value: String
+  let path: String
+  let domain: Option(String)
+  let max_age: Option(Int)
+  let http_only: Bool
+  let secure: Bool
+  let same_site: SameSite
+
+  new(
+    name: String,
+    value: String,
+    path: String,
+    domain: Option(String),
+    max_age: Option(Int),
+    http_only: Bool,
+    secure: Bool,
+    same_site: SameSite
+  ) {
+    self.name = name
+    self.value = value
+    self.path = path
+    self.domain = domain
+    self.max_age = max_age
+    self.http_only = http_only
+    self.secure = secure
+    self.same_site = same_site
+  }
+
+  with_path(path: String) -> Cookie {
+    Cookie(name, value, path, domain, max_age, http_only, secure, same_site)
+  }
+
+  with_domain(domain: String) -> Cookie {
+    Cookie(
+      name,
+      value,
+      path,
+      Some(domain),
+      max_age,
+      http_only,
+      secure,
+      same_site
+    )
+  }
+
+  /// How many seconds the browser keeps it. Zero removes it.
+  with_max_age(seconds: Int) -> Cookie {
+    Cookie(
+      name,
+      value,
+      path,
+      domain,
+      Some(seconds),
+      http_only,
+      secure,
+      same_site
+    )
+  }
+
+  /// Let page scripts read it. Leave this off for anything secret.
+  readable_by_scripts() -> Cookie {
+    Cookie(name, value, path, domain, max_age, False, secure, same_site)
+  }
+
+  /// Send it over plain HTTP too. Useful on `localhost`, during development.
+  allow_insecure() -> Cookie {
+    Cookie(name, value, path, domain, max_age, http_only, False, same_site)
+  }
+
+  with_same_site(same_site: SameSite) -> Cookie {
+    Cookie(name, value, path, domain, max_age, http_only, secure, same_site)
+  }
+
+  /// Check names, attributes and browser security rules before rendering.
+  ///
+  /// ```pooka
+  /// assert http.cookie("session", "abc").validate() == Ok(Nil)
+  /// let assert Error(_) = http.cookie("session", "abc; admin=yes").validate()
+  /// ```
+  validate() -> Result(Nil, String) {
+    _Ffi.validate_cookie(
+      name,
+      value,
+      path,
+      domain,
+      secure,
+      _same_site(same_site)
+    )
+  }
+
+  /// Render a cookie only when its attributes are safe to send.
+  ///
+  /// ```pooka
+  /// let assert Error(_) = http.cookie("bad name", "value").checked_header()
+  /// ```
+  checked_header() -> Result(String, String) {
+    validate()?
+    Ok(header())
+  }
+
+  /// The cookie as the value of a `set-cookie` header.
+  /// For values supplied by a caller, use `checked_header` first.
+  header() -> String {
+    let parts = [
+      Some(name + "=" + value),
+      Some("Path=" + path),
+      option.map(domain, fn(d) { "Domain=" + d }),
+      option.map(max_age, fn(age) { "Max-Age=" + int.to_string(age) }),
+      _when(http_only, "HttpOnly"),
+      _when(secure, "Secure"),
+      Some("SameSite=" + _same_site(same_site))
+    ]
+    string.join(list.filter_map(parts, fn(part) { part }), "; ")
+  }
+}
+
+/// A cookie for the whole site, hidden from page scripts, sent only over
+/// HTTPS, and kept to this site for anything but plain links: the safe
+/// defaults for a session.
+cookie(name: String, value: String) -> Cookie {
+  Cookie(name, value, "/", None, None, True, True, SameSite.Lax)
+}
+
+/// A cookie that tells the browser to forget an earlier one.
+expire_cookie(name: String) -> Cookie {
+  cookie(name, "").with_max_age(0)
+}
+
+_when(condition: Bool, text: String) -> Option(String) {
+  match condition {
+    True -> Some(text)
+    False -> None
+  }
+}
+
+_same_site(same_site: SameSite) -> String {
+  match same_site {
+    SameSite.Strict -> "Strict"
+    SameSite.Lax -> "Lax"
+    SameSite.NoRestriction -> "None"
+  }
+}
+
+_cookies(values: List(String)) -> List(#(String, String)) {
+  list.flat_map(values, fn(value: String) {
+    list.filter_map(string.split(value, ";"), fn(part: String) {
+      match string.split(string.trim(part), "=") {
+        [name, ..rest] if name != "" -> Some(#(name, string.join(rest, "=")))
+        _ -> None
+      }
+    })
+  })
+}
+
+// --- urls ---------------------------------------------------------------------
+
+external _Ffi from erlang "pooka_http_ffi" {
+  lowercase(text: String) -> String
+
+  validate_request(
+    method: String,
+    scheme: String,
+    host: String,
+    port: Option(Int),
+    path: String,
+    query: Option(String),
+    headers: List(#(String, String)),
+    body: BitArray
+  ) -> Result(Nil, String)
+
+  validate_cookie(
+    name: String,
+    value: String,
+    path: String,
+    domain: Option(String),
+    secure: Bool,
+    same_site: String
+  ) -> Result(Nil, String)
+}
+
+/// Decode a query string into pairs, in order.
+///
+/// ```pooka
+/// import pooka/http
+///
+/// assert http.parse_query("q=owl+%26+moss&page=2") == Ok([#("q", "owl & moss"), #("page", "2")])
+/// ```
+parse_query(query: String) -> Result(List(#(String, String)), Nil) {
+  match uri.dissect_query(query) {
+    Ok(pairs) -> Ok(pairs)
+    Error(_) -> Error(Nil)
+  }
+}
+
+/// Encode pairs as a query string.
+///
+/// ```pooka
+/// import pooka/http
+///
+/// assert http.encode_query([#("q", "owl & moss")]) == "q=owl+%26+moss"
+/// ```
+encode_query(pairs: List(#(String, String))) -> String {
+  uri.compose_query(pairs)
+}
+
+/// Encode text for one piece of a path: everything but letters, digits and
+/// `-._~` is written as `%XX`.
+percent_encode(text: String) -> String {
+  uri.percent_encode(text)
+}
+
+/// Decode `%XX` sequences. Fails if the result is not valid UTF-8.
+percent_decode(text: String) -> Result(String, Nil) {
+  match uri.percent_decode(text) {
+    Ok(value) -> Ok(value)
+    Error(_) -> Error(Nil)
+  }
+}
+
+_segments(path: String) -> List(String) {
+  list.filter_map(string.split(path, "/"), fn(piece: String) {
+    match piece {
+      "" -> None
+      _ -> match percent_decode(piece) {
+        Ok(decoded) -> Some(decoded)
+        Error(_) -> Some(piece)
+      }
+    }
+  })
+}
+
+_default_type(
+  headers: List(#(String, String)),
+  content_type: String
+) -> List(#(String, String)) {
+  match find_header(headers, "content-type") {
+    Some(_) -> headers
+    None -> set_header(headers, "content-type", content_type)
+  }
+}
