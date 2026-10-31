@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module http_test
+
+import pooka/http.{Request}
+
+test "methods read and write their names" {
+  assert http.method_from_string("GET") == http.Get()
+  assert http.method_from_string("post") == http.Post()
+  assert http.method_from_string("brew") == http.Other("BREW")
+  assert http.method_to_string(http.Delete()) == "DELETE"
+  assert http.method_to_string(http.Other("PROPFIND")) == "PROPFIND"
+}
+
+test "a URL becomes a request" {
+  let assert Ok(request) = http.get(
+    "https://Example.org:8443/books/the%20owl?lang=en&page=2"
+  )
+  assert request.method == http.Get()
+  assert request.scheme == "https"
+  assert request.host == "Example.org"
+  assert request.port == Some(8443)
+  assert request.path == "/books/the%20owl"
+  assert request.segments() == ["books", "the owl"]
+  assert request.query_params() == [#("lang", "en"), #("page", "2")]
+  assert request.query_param("page") == Some("2")
+  assert request.query_param("missing") == None
+  assert request.url() == "https://Example.org:8443/books/the%20owl?lang=en&page=2"
+}
+
+test "a URL without a path asks for the root" {
+  let assert Ok(request) = http.get("http://localhost")
+  assert request.path == "/"
+  assert request.segments() == []
+  assert request.port == None
+}
+
+test "a URL needs a scheme and a host" {
+  assert http.get("/owls") == Error(
+    "a URL needs a scheme and a host, such as https://example.org/"
+  )
+}
+
+test "empty path pieces are ignored" {
+  let request = http.default_request().with_path("//books///7/")
+  assert request.segments() == ["books", "7"]
+}
+
+test "headers ignore case, and keep repeats when asked" {
+  let request = http.default_request()
+    .with_header("Content-Type", "text/plain")
+    .with_header("CONTENT-TYPE", "application/json")
+  assert request.header("content-type") == Some("application/json")
+  assert request.headers == [#("content-type", "application/json")]
+  let headers = http.add_header(
+    http.add_header([], "Set-Cookie", "a=1"),
+    "set-cookie",
+    "b=2"
+  )
+  assert http.header_values(headers, "SET-COOKIE") == ["a=1", "b=2"]
+}
+
+test "bodies are bytes, and can be read as text" {
+  let request = http.default_request().with_text("hoo")
+  assert request.body == <<"hoo":utf8>>
+  assert request.text() == Ok("hoo")
+  assert request.header("content-type") == Some("text/plain; charset=utf-8")
+  assert http.default_request().with_body(<<255>>).text() == Error(Nil)
+  let json = http.default_request().with_json("{}")
+  assert json.header("content-type") == Some("application/json")
+}
+
+test "queries are encoded and decoded" {
+  let request = http.default_request().with_query(
+    [#("q", "owl & moss"), #("é", "1")]
+  )
+  assert request.query == Some("q=owl+%26+moss&%C3%A9=1")
+  assert request.query_params() == [#("q", "owl & moss"), #("é", "1")]
+  assert http.parse_query("flag&x=") == Ok([#("flag", ""), #("x", "")])
+  assert http.default_request().with_query([]).query == None
+}
+
+test "percent encoding" {
+  assert http.percent_encode("a b/é") == "a%20b%2F%C3%A9"
+  assert http.percent_decode("a%20b%C3%A9") == Ok("a bé")
+  assert http.percent_decode("%FF") == Error(Nil)
+}
+
+test "response helpers" {
+  let reply = http.text(200, "hoo")
+  assert reply.status == 200
+  assert reply.text() == Ok("hoo")
+  assert reply.is_success()
+  assert !http.response(404).is_success()
+  assert http.json(201, "[]").header("Content-Type") == Some("application/json")
+  assert http.html(200, "<p>").header("content-type") == Some(
+    "text/html; charset=utf-8"
+  )
+  assert http.redirect("/done").header("location") == Some("/done")
+  assert http.redirect("/done").status == 303
+  assert http.reason(404) == "Not Found"
+  assert http.reason(299) == ""
+}
+
+test "cookies have safe defaults" {
+  assert http.cookie("session", "abc").header() == "session=abc; Path=/; HttpOnly; Secure; SameSite=Lax"
+  let relaxed = http.cookie("theme", "dark")
+    .readable_by_scripts()
+    .allow_insecure()
+    .with_same_site(http.SameSite.Strict)
+    .with_domain("example.org")
+    .with_path("/shop")
+  assert relaxed.header() == "theme=dark; Path=/shop; Domain=example.org; SameSite=Strict"
+  assert http.expire_cookie("session").header() == "session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+}
+
+test "a response can set several cookies" {
+  let reply = http.text(200, "")
+    .set_cookie(http.cookie("a", "1"))
+    .set_cookie(http.cookie("b", "2"))
+  assert reply.headers == [
+    #("content-type", "text/plain; charset=utf-8"),
+    #("set-cookie", "a=1; Path=/; HttpOnly; Secure; SameSite=Lax"),
+    #("set-cookie", "b=2; Path=/; HttpOnly; Secure; SameSite=Lax")
+  ]
+}
+
+test "requests read the cookies they carry" {
+  let request = http.default_request().with_header(
+    "Cookie",
+    "session=abc; theme=dark; token=a=b"
+  )
+  assert request.cookies() == [
+    #("session", "abc"),
+    #("theme", "dark"),
+    #("token", "a=b")
+  ]
+  assert request.cookie("theme") == Some("dark")
+  assert request.cookie("missing") == None
+}
+
+_route(request: Request) -> String {
+  match #(request.method, request.segments()) {
+    #(http.Get, []) -> "home"
+    #(http.Get, ["books", id]) -> "book " + id
+    #(http.Post, ["books"]) -> "new book"
+    _ -> "not found"
+  }
+}
+
+test "requests can be routed by matching" {
+  let request = http.default_request()
+  assert _route(request) == "home"
+  assert _route(request.with_path("/books/7")) == "book 7"
+  assert _route(request.with_method(http.Post()).with_path("/books")) == "new book"
+  assert _route(request.with_method(http.Delete()).with_path("/books")) == "not found"
+}
+
+test "header helpers fold both stored names and requested names" {
+  let fields = [#("Content-Type", "text/plain"), #("CONTENT-TYPE", "text/html")]
+  assert http.find_header(fields, "content-type") == Some("text/plain")
+  assert http.header_values(fields, "Content-Type") == [
+    "text/plain",
+    "text/html"
+  ]
+  assert http.set_header(fields, "content-TYPE", "application/json") == [
+    #("content-type", "application/json")
+  ]
+}
+
+test "IPv6 URLs keep their authority brackets" {
+  let assert Ok(request) = http.get("http://[::1]:8080/books?q=owl")
+  assert request.url() == "http://[::1]:8080/books?q=owl"
+}
+
+test "HTTP URLs reject unrelated schemes credentials and invalid ports" {
+  let assert Error(_) = http.get("ftp://example.org/file")
+  let assert Error(_) = http.get("https://user:secret@example.org/")
+  let assert Error(_) = http.get("http://localhost:0/")
+  let assert Error(_) = http.get("http://localhost:65536/")
+  let assert Ok(_) = http.get("http://localhost:65535/")
+}
+
+test "checked components reject malformed escapes and invalid UTF8" {
+  assert http.percent_decode("%zz") == Error(Nil)
+  assert http.percent_decode("%") == Error(Nil)
+  assert http.percent_decode("%FF") == Error(Nil)
+  assert http.parse_query("a=%zz") == Error(Nil)
+  assert http.default_request().with_path("/good/%zz").checked_segments() == Error(
+    Nil
+  )
+  assert http.default_request().with_path("/one/two%20birds").checked_segments() == Ok(
+    ["one", "two birds"]
+  )
+}
+
+test "TRACE and CONNECT retain their standard method identities" {
+  assert http.method_from_string("trace") == http.Trace()
+  assert http.method_from_string("CONNECT") == http.Connect()
+  assert http.method_to_string(http.Trace()) == "TRACE"
+  assert http.method_to_string(http.Connect()) == "CONNECT"
+}
+
+test "requests reject injected fields and transport framing" {
+  assert http.default_request().validate() == Ok(Nil)
+  let assert Error(_) = http.default_request().with_header(
+    "x-note",
+    "safe\r\nforged: yes"
+  ).validate()
+  let assert Error(_) = http.default_request().with_header("bad name", "value").validate()
+  let assert Error(_) = http.default_request().with_header(
+    "Content-Length",
+    "0"
+  ).validate()
+  let assert Error(_) = http.default_request().with_path("/two birds").validate()
+  let assert Error(_) = http.default_request().with_body(<<1:1>>).validate()
+}
+
+test "cookies validate octets attributes and security prefixes" {
+  let assert Ok(_) = http.cookie("session", "abc123").checked_header()
+  let assert Error(_) = http.cookie("bad name", "value").checked_header()
+  let assert Error(_) = http.cookie("session", "abc; admin=yes").checked_header()
+  let assert Error(_) = http.cookie("session", "value").with_path("/; Secure").checked_header()
+  let assert Error(_) = http.cookie("session", "value").with_domain(
+    "site\r\nInjected: yes"
+  ).checked_header()
+  let assert Error(_) = http.cookie("session", "value").with_same_site(
+    http.SameSite.NoRestriction
+  ).allow_insecure().checked_header()
+  let assert Error(_) = http.cookie("__Secure-id", "value").allow_insecure().checked_header()
+  let assert Error(_) = http.cookie("__Host-id", "value").with_domain(
+    "example.org"
+  ).checked_header()
+  let assert Error(_) = http.cookie("__Host-id", "value").with_path("/nested").checked_header()
+  assert http.cookie("__Host-id", "value").validate() == Ok(Nil)
+}
