@@ -19,7 +19,7 @@ assert request.query_param("q") == Some("owl")
 
 Shared HTTP vocabulary without a server or client. Header lookup ignores case. Checked component and cookie helpers report invalid input; `Request.validate()` checks a request before it goes on the wire.
 
-See the [API documentation](https://pooka-http.hexdocs.pm/) for the rest. Built for [Pooka](https://pooka.run) and Erlang/OTP 29.
+See the [API documentation](https://pooka-http.hexdocs.pm/) for the rest.
 
 ## Licence
 
