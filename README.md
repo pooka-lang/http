@@ -11,10 +11,14 @@ pooka add pooka_http
 ```
 
 ```pooka
+module main
+
 import pooka/http
 
-let assert Ok(request) = http.get("https://example.org/birds?q=owl")
-assert request.query_param("q") == Some("owl")
+main() {
+  let assert Ok(request) = http.get("https://example.org/birds?q=owl")
+  assert request.query_param("q") == Some("owl")
+}
 ```
 
 Shared HTTP vocabulary without a server or client. Header lookup ignores case. Checked component and cookie helpers report invalid input; `Request.validate()` checks a request before it goes on the wire.
